@@ -12,7 +12,7 @@
 #define DID 0xbeef
 
 static struct wiphy *common_wiphy;
-
+static struct wireless_dev *common_wdev;
 static struct net_device *common_netdev;
 
 struct wifi_sim_wiphy_priv {
@@ -164,7 +164,12 @@ static int wifi_sim_scan(struct wiphy *wiphy,
 		return -EBUSY;
 
 	priv->scan_request = request;
-	// schedule_delayed_work(&priv->scan_result, HZ * 2);
+	
+
+	/* No real hardware → complete scan immediately */
+	cfg80211_scan_done(request, false);
+
+	priv->scan_request = NULL;
 
 	return 0;
 }
@@ -215,16 +220,6 @@ static int wifi_sim_disconnect(struct wiphy *wiphy, struct net_device *netdev,
 	return 0;
 }
 
-static const struct cfg80211_ops wifi_sim_cfg80211_ops = {
-	.scan = wifi_sim_scan,
-
-	.connect = wifi_sim_connect,
-	.disconnect = wifi_sim_disconnect,
-
-	// .get_station = wifi_sim_get_station,
-	// .dump_station = wifi_sim_dump_station,
-};
-
 
 /*
 * NET DEVICE OPERATIONS
@@ -273,13 +268,106 @@ static int wifi_sim_net_device_stop(struct net_device *dev)
 	return 0;
 }
 
+static void wifi_sim_get_stats64(struct net_device *dev,
+                                 struct rtnl_link_stats64 *stats)
+{
+    struct wifi_sim_netdev_priv *priv = netdev_priv(dev);
+
+    stats->tx_packets = priv->tx_packets;
+    stats->tx_errors  = priv->tx_failed;
+}
 
 static const struct net_device_ops wifi_netdev_ops = {
-	.ndo_start_xmit = wifi_sim_start_xmit,
-	.ndo_open	= wifi_sim_net_device_open,
-	.ndo_stop	= wifi_sim_net_device_stop,
+	.ndo_start_xmit   = wifi_sim_start_xmit,
+	.ndo_open	      = wifi_sim_net_device_open,
+	.ndo_stop	      = wifi_sim_net_device_stop,
+	.ndo_get_stats64  = wifi_sim_get_stats64,
+	
 	// .ndo_get_iflink = wifi_sim_net_device_get_iflink,
 };
+
+
+static struct wireless_dev *
+wifi_sim_add_interface(struct wiphy *wiphy,
+		       const char *name,
+		       unsigned char name_assign_type,
+		       enum nl80211_iftype type,
+		       struct vif_params *params)
+{
+	struct net_device *netdev;
+	struct wireless_dev *wdev;
+	struct wifi_sim_netdev_priv *priv;
+
+	if (type != NL80211_IFTYPE_STATION)
+		return ERR_PTR(-EOPNOTSUPP);
+
+	netdev = alloc_netdev(sizeof(*priv), name,
+			      name_assign_type, ether_setup);
+	if (!netdev)
+		return ERR_PTR(-ENOMEM);
+
+	netdev->netdev_ops = &wifi_netdev_ops;
+	SET_NETDEV_DEV(netdev, wiphy_dev(wiphy));
+
+	wdev = kzalloc(sizeof(*wdev), GFP_KERNEL);
+	if (!wdev) {
+		free_netdev(netdev);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	wdev->wiphy  = wiphy;
+	wdev->netdev = netdev;
+	wdev->iftype = type;
+
+	netdev->ieee80211_ptr = wdev;
+
+	priv = netdev_priv(netdev);
+	priv->is_up = false;
+	priv->is_connected = false;
+
+	if (register_netdev(netdev)) {
+		kfree(wdev);
+		free_netdev(netdev);
+		return ERR_PTR(-EINVAL);
+	}
+
+	wiphy_info(wiphy, "interface %s created\n", netdev->name);
+	return wdev;
+}
+
+static int
+wifi_sim_del_interface(struct wiphy *wiphy, struct wireless_dev *wdev)
+{
+	struct net_device *netdev = wdev->netdev;
+	struct wifi_sim_netdev_priv *priv = netdev_priv(netdev);
+
+	/* Mark interface as being deleted */
+	priv->being_deleted = true;
+
+	netif_carrier_off(netdev);
+	unregister_netdev(netdev);
+	
+	kfree(wdev);
+	// free_netdev(netdev);   // unregister_netdev() let cfg80211 already schedule free_netdev() internally
+
+	wiphy_info(wiphy, "interface removed\n");
+	return 0;
+}
+
+
+static const struct cfg80211_ops wifi_sim_cfg80211_ops = {
+	.scan = wifi_sim_scan,
+	.connect = wifi_sim_connect,
+	.disconnect = wifi_sim_disconnect,
+
+	.add_virtual_intf = wifi_sim_add_interface,
+	.del_virtual_intf = wifi_sim_del_interface,
+
+	// .get_station = wifi_sim_get_station,
+	// .dump_station = wifi_sim_dump_station,
+};
+
+
 
 
 /* Acquires and releases the rtnl lock. */
@@ -319,42 +407,45 @@ static struct wiphy *wifi_sim_make_wiphy(void) {
 	return wiphy;
 }
 
-static struct net_device *wifi_sim_make_netdev(void) { 
-	struct net_device *netdev;
-	struct wifi_sim_netdev_priv *priv;
-	int err;
+// static struct net_device *wifi_sim_make_netdev(void) { 
+// 	struct net_device *netdev;
+// 	struct wifi_sim_netdev_priv *priv;
+// 	int err;
 
-	printk("pci-wifi-drv - Creating net_device\n");
-	netdev = alloc_etherdev(sizeof(*priv));
-	if(!netdev)
-		return NULL;
+// 	printk("pci-wifi-drv - Creating net_device\n");
+// 	netdev = alloc_etherdev(sizeof(*priv));
+// 	if(!netdev)
+// 		return NULL;
 
-	// SET_NETDEV_DEV(netdev, &pdev->dev); // Todo: where is pdev ??
-	netdev->netdev_ops = &wifi_netdev_ops;
-	netdev->needs_free_netdev  = true;
+// 	// SET_NETDEV_DEV(netdev, &pdev->dev); // Todo: where is pdev ??
+// 	netdev->netdev_ops = &wifi_netdev_ops;
+// 	netdev->needs_free_netdev  = true;
 
-	// 4. Link wiphy to net_device
-	struct wireless_dev *wdev;
-	netdev->ieee80211_ptr = kzalloc(sizeof(*netdev->ieee80211_ptr), GFP_KERNEL);
-	if (!netdev->ieee80211_ptr) {
-		err = -ENOMEM;
-		goto remove_handler;
-	}
+// 	// SET_NETDEV_DEV(netdev, &priv->lowerdev->dev);   // Todo: who will be parent ?   
+// 	// 4. Link wiphy to net_device
+// 	struct wireless_dev *wdev;
+// 	wdev = netdev->ieee80211_ptr; 
 
-	wdev = netdev->ieee80211_ptr;  // Todo: is bracket necessary? 
+// 	wdev = kzalloc(sizeof(*netdev->ieee80211_ptr), GFP_KERNEL);
+// 	if (!netdev->ieee80211_ptr) {
+// 		err = -ENOMEM;
+// 		goto remove_handler;
+// 	}
 
-	wdev->wiphy = common_wiphy;
-	wdev->netdev = netdev;
-	wdev->iftype = NL80211_IFTYPE_STATION;
-	register_netdev(netdev);
+	
 
-	return netdev;
+// 	wdev->wiphy = common_wiphy;
+// 	wdev->netdev = netdev;
+// 	wdev->iftype = NL80211_IFTYPE_STATION;
+// 	register_netdev(netdev);
 
-	remove_handler:
-		free_netdev(netdev);
-		return NULL;
+// 	return netdev;
 
-}
+// 	remove_handler:
+// 		free_netdev(netdev);
+// 		return NULL;
+
+// }
 
 static int wifi_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
 	
@@ -393,11 +484,18 @@ static int wifi_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
 	common_wiphy = wifi_sim_make_wiphy();
 	if (!common_wiphy)
 		goto notifier;
-	
-	common_netdev = wifi_sim_make_netdev();
 
 
+	common_wdev = wifi_sim_add_interface(common_wiphy,
+				"wlan0",
+				NET_NAME_ENUM,
+				NL80211_IFTYPE_STATION,
+				NULL);
 
+	if (IS_ERR(common_wdev)) {
+		wiphy_err(common_wiphy, "failed to create default STA interface\n");
+		return PTR_ERR(common_wdev);
+	}
 
 
 	return 0;
@@ -419,6 +517,12 @@ static void wifi_sim_destroy_wiphy(struct wiphy *wiphy)
 	priv->being_deleted = true;
 	// wifi_sim_cancel_scan(wiphy);
 
+	/* Abort ongoing scan */
+	if (priv->scan_request) {
+		cfg80211_scan_done(priv->scan_request, true);
+		priv->scan_request = NULL;
+	}
+	
 	if (wiphy->registered)
 		wiphy_unregister(wiphy);
 	wiphy_free(wiphy);
@@ -428,29 +532,20 @@ static void wifi_remove(struct pci_dev *pdev)
 {
 	printk("pci-wifi-drv - Removing the device\n");
 
-	/* 1. Unregister and free net_device */
-	if (common_netdev) {
-		struct wireless_dev *wdev = common_netdev->ieee80211_ptr;
-
-		unregister_netdev(common_netdev);
-
-		if (wdev)
-			kfree(wdev);
-
-		/* alloc_etherdev() + needs_free_netdev = true
-		 * → free_netdev() is called automatically
-		 */
-		common_netdev = NULL;
-	}
-
-	/* 2. Unregister and free wiphy */
+	if (common_wiphy && common_wdev) {
+        wifi_sim_del_interface(common_wiphy, common_wdev);
+        common_wdev = NULL;
+    }
+	
 	if (common_wiphy) {
 		wifi_sim_destroy_wiphy(common_wiphy);
 		common_wiphy = NULL;
 	}
 
-	/* 3. PCI resources are auto-freed because of pcim_* */
+
 }
+
+
 
 static struct pci_driver wifi_driver = {
 	.name = "pci-wifi-driver",
