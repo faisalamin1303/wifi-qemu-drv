@@ -152,11 +152,38 @@ static struct pci_device_id wifi_ids[] = {
 };
 MODULE_DEVICE_TABLE(pci, wifi_ids);
 
+
+static void wifi_sim_inform_bss(struct wiphy *wiphy)
+{
+	u64 tsf = div_u64(ktime_get_boottime_ns(), 1000);
+	struct cfg80211_bss *informed_bss;
+	const u8 bssid[ETH_ALEN] = { 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 };
+	static const struct {
+		u8 tag;
+		u8 len;
+		u8 ssid[8];
+	} __packed ssid = {
+		.tag = WLAN_EID_SSID,
+		.len = 8,
+		.ssid = "Wifi_sim",
+	};
+
+	informed_bss = cfg80211_inform_bss(wiphy, &channel_5ghz,
+					   CFG80211_BSS_FTYPE_PRESP,
+					   bssid, tsf,
+					   WLAN_CAPABILITY_ESS, 0,
+					   (void *)&ssid, sizeof(ssid),
+					   DBM_TO_MBM(-50), GFP_KERNEL);
+	cfg80211_put_bss(wiphy, informed_bss);
+}
+
+
 /* Called with the rtnl lock held. */
 static int wifi_sim_scan(struct wiphy *wiphy,
 			  struct cfg80211_scan_request *request)
 {
 	struct wifi_sim_wiphy_priv *priv = wiphy_priv(wiphy);
+	struct cfg80211_scan_info scan_info = { .aborted = false };
 
 	wiphy_debug(wiphy, "scan\n");
 
@@ -165,10 +192,10 @@ static int wifi_sim_scan(struct wiphy *wiphy,
 
 	priv->scan_request = request;
 	
+	wifi_sim_inform_bss(wiphy);
 
 	/* No real hardware → complete scan immediately */
-	cfg80211_scan_done(request, false);
-
+	cfg80211_scan_done(priv->scan_request, &scan_info);
 	priv->scan_request = NULL;
 
 	return 0;
@@ -176,29 +203,46 @@ static int wifi_sim_scan(struct wiphy *wiphy,
 
 /* Called with the rtnl lock held. */
 static int wifi_sim_connect(struct wiphy *wiphy, struct net_device *netdev,
-			     struct cfg80211_connect_params *sme)
+                            struct cfg80211_connect_params *sme)
 {
-	struct wifi_sim_netdev_priv *priv = netdev_priv(netdev);
-	// bool could_schedule;
+    struct wifi_sim_netdev_priv *priv = netdev_priv(netdev);
 
-	// if (priv->being_deleted || !priv->is_up)
-	// 	return -EBUSY;
+    wiphy_info(wiphy, "connect requested to SSID: %s\n", sme->ssid);
 
-	// could_schedule = schedule_delayed_work(&priv->connect, HZ * 2);
-	// if (!could_schedule)
-	// 	return -EBUSY;
+    if (priv->being_deleted || !priv->is_up)
+        return -EBUSY;
 
-	if (sme->bssid) {
+    /* Only accept our fake SSID */
+    if (sme->ssid_len != 8 || strncmp(sme->ssid, "Wifi_sim", 8) != 0) {
+        wiphy_err(wiphy, "unknown SSID\n");
+        return -ENOENT;
+    }
+
+    /* Set BSSID */
+    if (sme->bssid) {
 		ether_addr_copy(priv->connect_requested_bss, sme->bssid);
-	} 
-	// else {
-	// 	wifi_sim_inform_bss(wiphy);
-	// 	eth_zero_addr(priv->connect_requested_bss);
-	// }
+	} else {
+		wifi_sim_inform_bss(wiphy);
+		eth_zero_addr(priv->connect_requested_bss);
+	}
+    /* Mark as connected */
+    priv->is_connected = true;
 
-	wiphy_debug(wiphy, "connect\n");
+    /* Bring carrier up */
+    netif_carrier_on(netdev);
+	
+	u16 status = WLAN_STATUS_SUCCESS;
 
-	return 0;
+    /* Notify cfg80211/wpa_supplicant that connection succeeded */
+    cfg80211_connect_result(netdev,
+                            priv->connect_requested_bss,
+                            NULL, 0,   /* no IE */
+                            NULL, 0,
+							status,         /* status = success */
+                            GFP_KERNEL);
+
+    wiphy_info(wiphy, "connected to %pM\n", priv->connect_requested_bss);
+    return 0;
 }
 
 /* Called with the rtnl lock held. Acquires the rdev event lock. */
@@ -237,9 +281,13 @@ static netdev_tx_t wifi_sim_start_xmit(struct sk_buff *skb,
 		return NET_XMIT_DROP;
 	}
 
+	/* For now, just drop packets instead of sending */
+    dev_kfree_skb(skb);
+    return NET_XMIT_SUCCESS;
+
 	// skb->dev = priv->lowerdev;
 	// return dev_queue_xmit(skb);
-	return 0;
+	// return 0;
 }
 
 /* Called with rtnl lock held. */
