@@ -8,6 +8,20 @@
 #include <linux/math64.h>
 #include <linux/module.h>
 
+#define WIFI_CMD_REG        0x00  // write
+#define WIFI_STATUS_REG     0x04  // read/write
+#define WIFI_RESP_COUNT     0x08  // read
+#define WIFI_RESP_BASE      0x100 // BAR1 offset
+
+#define WIFI_CMD_SCAN       1
+
+#define WIFI_STATUS_IDLE    0
+#define WIFI_STATUS_BUSY    1
+#define WIFI_STATUS_DONE    2
+
+
+void __iomem *ptr_bar0, __iomem *ptr_bar1;
+
 #define VID 0x1234
 #define DID 0xbeef
 
@@ -17,6 +31,7 @@ static struct net_device *common_netdev;
 
 struct wifi_sim_wiphy_priv {
 	// struct delayed_work scan_result;
+	struct delayed_work scan_work;
 	struct cfg80211_scan_request *scan_request;
 	bool being_deleted;
 };
@@ -143,6 +158,29 @@ static struct ieee80211_supported_band band_5ghz = {
 	},
 };
 
+struct wifi_fw_scan_cmd {
+    u8  n_ssids;
+    u8  n_channels;
+    u8  flags;
+    u8  reserved;
+
+    struct {
+        u8 len;
+        u8 ssid[32];
+    } ssids[4];
+
+    u16 channels[32];
+};
+
+struct wifi_fw_scan_resp {
+    u8  bssid[ETH_ALEN];
+    s8  rssi;
+    u8  channel;
+    u8  ssid_len;
+    u8  ssid[32];
+};
+
+
 
 static u8 router_bssid[ETH_ALEN] = {};
 
@@ -157,33 +195,98 @@ static void wifi_sim_inform_bss(struct wiphy *wiphy)
 {
 	u64 tsf = div_u64(ktime_get_boottime_ns(), 1000);
 	struct cfg80211_bss *informed_bss;
-	const u8 bssid[ETH_ALEN] = { 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 };
-	static const struct {
-		u8 tag;
-		u8 len;
-		u8 ssid[8];
-	} __packed ssid = {
-		.tag = WLAN_EID_SSID,
-		.len = 8,
-		.ssid = "Wifi_sim",
-	};
+	// const u8 bssid[ETH_ALEN] = { 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 };
+	
 
-	informed_bss = cfg80211_inform_bss(wiphy, &channel_5ghz,
-					   CFG80211_BSS_FTYPE_PRESP,
-					   bssid, tsf,
-					   WLAN_CAPABILITY_ESS, 0,
-					   (void *)&ssid, sizeof(ssid),
-					   DBM_TO_MBM(-50), GFP_KERNEL);
-	cfg80211_put_bss(wiphy, informed_bss);
+	int count = ioread32(ptr_bar0 + WIFI_RESP_COUNT);
+	struct wifi_fw_scan_resp resp;
+	
+	printk("WIFI_SIM: Device response received !\n");
+	printk("WIFI_SIM: Response SSID count = %d\n", count);
+	
+		for (int i = 0; i < count; i++) {
+		memcpy_fromio(&resp,
+			ptr_bar1 + WIFI_RESP_BASE + i * sizeof(resp),
+			sizeof(resp));
+
+		printk("WIFI_SIM:  Response SSID[%d]: len=%u, value=\"%.*s\"\n",
+			i,
+			resp.ssid_len,
+			resp.ssid_len,
+			resp.ssid);
+		printk("WIFI_SIM: Response rssi = %d\n", resp.rssi);
+			
+		// struct {
+		// 	u8 tag;
+		// 	u8 len;
+		// 	u8 ssid[8];
+		// } __packed ssid = {
+		// 	.tag = WLAN_EID_SSID,
+		// 	.len = resp.ssid_len,
+		// 	.ssid = resp.ssid,
+		// };
+
+		u8 ie[2 + 32];
+
+		ie[0] = WLAN_EID_SSID;
+		ie[1] = resp.ssid_len;
+		memcpy(&ie[2], resp.ssid, resp.ssid_len);
+
+		informed_bss = cfg80211_inform_bss(wiphy,
+			&channel_5ghz,
+			CFG80211_BSS_FTYPE_PRESP,
+			resp.bssid,
+			tsf,
+			WLAN_CAPABILITY_ESS,
+			0,
+			ie,
+			2 + resp.ssid_len,
+			resp.rssi * 100,
+			GFP_KERNEL);
+		cfg80211_put_bss(wiphy, informed_bss);
+	}
+
 }
 
+static void wifi_sim_scan_work(struct work_struct *work)
+{
+	printk("WIFI_SIM: Attempt reading Scan result...\n");
+
+    struct wifi_sim_wiphy_priv *priv =
+        container_of(work, struct wifi_sim_wiphy_priv, scan_work.work);
+
+	//Todo: bar0, bar1 should be the members of struct wifi_sim_wiphy_priv i.e. ioread32(priv->bar0
+
+	if (ioread32(ptr_bar0 + WIFI_STATUS_REG) != WIFI_STATUS_DONE) {
+        schedule_delayed_work(&priv->scan_work, HZ * 2);
+        return;
+    }
+
+	printk("WIFI_SIM: WIFI_STATUS_DONE ! \n");
+	struct wiphy *wiphy = priv_to_wiphy(priv);
+
+
+	wifi_sim_inform_bss(wiphy);
+
+	struct cfg80211_scan_info scan_info = { .aborted = false };
+
+	rtnl_lock();
+	// /* No real hardware → complete scan immediately */
+	cfg80211_scan_done(priv->scan_request, &scan_info);
+
+	// cfg80211_scan_done(priv->scan_request, false);
+	priv->scan_request = NULL;
+	iowrite32(WIFI_STATUS_IDLE, ptr_bar0 + WIFI_STATUS_REG);
+	rtnl_unlock();
+
+}
 
 /* Called with the rtnl lock held. */
 static int wifi_sim_scan(struct wiphy *wiphy,
 			  struct cfg80211_scan_request *request)
 {
 	struct wifi_sim_wiphy_priv *priv = wiphy_priv(wiphy);
-	struct cfg80211_scan_info scan_info = { .aborted = false };
+	// struct cfg80211_scan_info scan_info = { .aborted = false };
 
 	wiphy_debug(wiphy, "scan\n");
 
@@ -191,12 +294,63 @@ static int wifi_sim_scan(struct wiphy *wiphy,
 		return -EBUSY;
 
 	priv->scan_request = request;
-	
-	wifi_sim_inform_bss(wiphy);
 
-	/* No real hardware → complete scan immediately */
-	cfg80211_scan_done(priv->scan_request, &scan_info);
-	priv->scan_request = NULL;
+	struct wifi_fw_scan_cmd cmd = {0};
+	int i;
+
+	printk(KERN_INFO "WIFI_SIM: SCAN request received\n");
+	/* Fill SSIDs */
+	cmd.n_ssids = min(request->n_ssids, 4);
+	// cmd.n_ssids = 4;
+	printk(KERN_INFO "WIFI_SIM: Number of SSIDs = %d\n", cmd.n_ssids);
+
+	for (i = 0; i < cmd.n_ssids; i++) {
+		cmd.ssids[i].len = request->ssids[i].ssid_len;
+		// cmd.ssids[i].len = 5;
+		memcpy(cmd.ssids[i].ssid,
+			request->ssids[i].ssid,
+			request->ssids[i].ssid_len);
+
+		// for(int j=0; j < 5; j++) {
+		// 	cmd.ssids[i].ssid[j] = i + j;
+		// }
+		
+		printk(KERN_INFO
+           "WIFI_SIM: SSID[%d]: len=%u, value=\"%.*s\"\n",
+           i,
+           cmd.ssids[i].len,
+           cmd.ssids[i].len,
+           cmd.ssids[i].ssid);
+	}
+
+	for (i = 0; i < cmd.n_ssids; i++) {
+		printk("WIFI_SIM: SSID[%d] = ", i);
+		for(int j=0; j < 5; j++) {
+			printk("%d ,", cmd.ssids[i].ssid[j]);
+		}
+		printk("\n");
+	}
+
+	/* Fill channels */
+	cmd.n_channels = min(request->n_channels, 32);
+	for (i = 0; i < cmd.n_channels; i++)
+		cmd.channels[i] = request->channels[i]->hw_value;
+
+	if (ioread32(ptr_bar0 + WIFI_STATUS_REG) == WIFI_STATUS_IDLE) {
+		memcpy_toio(ptr_bar1 + WIFI_RESP_BASE, &cmd, sizeof(cmd));
+		printk("WIFI_SIM: scan REQ sent to device\n");
+		iowrite32(WIFI_CMD_SCAN, ptr_bar0 + WIFI_CMD_REG);
+		// iowrite32(WIFI_STATUS_BUSY, ptr_bar0 + WIFI_STATUS_REG);
+		printk("WIFI_SIM: scan CMD sent to device\n");
+		schedule_delayed_work(&priv->scan_work, HZ * 2);
+	} 
+	else
+		printk("WIFI_SIM: scan_req can't be forward to dev as WIFI_STATUS_REG != IDLE");
+	// wifi_sim_inform_bss(wiphy);
+
+	// /* No real hardware → complete scan immediately */
+	// cfg80211_scan_done(priv->scan_request, &scan_info);
+	// priv->scan_request = NULL;
 
 	return 0;
 }
@@ -207,7 +361,7 @@ static int wifi_sim_connect(struct wiphy *wiphy, struct net_device *netdev,
 {
     struct wifi_sim_netdev_priv *priv = netdev_priv(netdev);
 
-    wiphy_info(wiphy, "connect requested to SSID: %s\n", sme->ssid);
+    printk("WIFI_SIM: connect requested to SSID: %s\n", sme->ssid);
 
     if (priv->being_deleted || !priv->is_up)
         return -EBUSY;
@@ -221,10 +375,11 @@ static int wifi_sim_connect(struct wiphy *wiphy, struct net_device *netdev,
     /* Set BSSID */
     if (sme->bssid) {
 		ether_addr_copy(priv->connect_requested_bss, sme->bssid);
-	} else {
-		wifi_sim_inform_bss(wiphy);
-		eth_zero_addr(priv->connect_requested_bss);
-	}
+	} 
+	// else {
+	// 	wifi_sim_inform_bss(wiphy);
+	// 	eth_zero_addr(priv->connect_requested_bss);
+	// }
     /* Mark as connected */
     priv->is_connected = true;
 
@@ -241,7 +396,7 @@ static int wifi_sim_connect(struct wiphy *wiphy, struct net_device *netdev,
 							status,         /* status = success */
                             GFP_KERNEL);
 
-    wiphy_info(wiphy, "connected to %pM\n", priv->connect_requested_bss);
+    printk("WIFI_SIM: connected to %pM\n", priv->connect_requested_bss);
     return 0;
 }
 
@@ -424,7 +579,7 @@ static struct wiphy *wifi_sim_make_wiphy(void) {
 	struct wifi_sim_wiphy_priv *priv;
 	int err;
 
-	printk("pci-wifi-drv - Creating wiphy \n");
+	printk("WIFI_SIM: pci-wifi-drv - Creating wiphy \n");
 	wiphy = wiphy_new(&wifi_sim_cfg80211_ops, sizeof(*priv));
 
 	if (!wiphy)
@@ -443,11 +598,11 @@ static struct wiphy *wifi_sim_make_wiphy(void) {
 	priv = wiphy_priv(wiphy);
 	priv->being_deleted = false;
 	priv->scan_request = NULL;
-	// INIT_DELAYED_WORK(&priv->scan_result, wifi_sim_scan_result);
+	INIT_DELAYED_WORK(&priv->scan_work, wifi_sim_scan_work);
 
 	err = wiphy_register(wiphy);
 	if (err < 0) {
-		printk("pci-wifi-drv - wiphy can't be registered!\n");
+		printk("WIFI_SIM: pci-wifi-drv - wiphy can't be registered!\n");
 		wiphy_free(wiphy);
 		return NULL;
 	}
@@ -460,7 +615,7 @@ static struct wiphy *wifi_sim_make_wiphy(void) {
 // 	struct wifi_sim_netdev_priv *priv;
 // 	int err;
 
-// 	printk("pci-wifi-drv - Creating net_device\n");
+// 	printk("WIFI_SIM: pci-wifi-drv - Creating net_device\n");
 // 	netdev = alloc_etherdev(sizeof(*priv));
 // 	if(!netdev)
 // 		return NULL;
@@ -499,21 +654,21 @@ static int wifi_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
 	
 	int status;
 	// int err;
-	void __iomem *ptr_bar0, __iomem *ptr_bar1;
+	// void __iomem *ptr_bar0, __iomem *ptr_bar1;
 	status = pcim_enable_device(pdev);
 	if(status != 0){
-		printk("pci-wifi-drv - Error enabling device\n");
+		printk("WIFI_SIM: pci-wifi-drv - Error enabling device\n");
 		return status;
 	}
 	ptr_bar0 = pcim_iomap(pdev, 0, pci_resource_len(pdev, 0));
 	if(!ptr_bar0) {
-		printk("pci-wifi-drv - Error mapping BAR0\n");
+		printk("WIFI_SIM: pci-wifi-drv - Error mapping BAR0\n");
 		return -ENODEV;
 	}
 
 	ptr_bar1 = pcim_iomap(pdev, 1, pci_resource_len(pdev, 1));
 	if(!ptr_bar1) {
-		printk("pci-wifi-drv - Error mapping BAR1\n");
+		printk("WIFI_SIM: pci-wifi-drv - Error mapping BAR1\n");
 		return -ENODEV;
 	}
 	// printk("pci-wifi-drv - ID: 0x%x\n", ioread32(ptr_bar0));
@@ -578,7 +733,7 @@ static void wifi_sim_destroy_wiphy(struct wiphy *wiphy)
 
 static void wifi_remove(struct pci_dev *pdev)
 {
-	printk("pci-wifi-drv - Removing the device\n");
+	printk("WIFI_SIM: pci-wifi-drv - Removing the device\n");
 
 	if (common_wiphy && common_wdev) {
         wifi_sim_del_interface(common_wiphy, common_wdev);
