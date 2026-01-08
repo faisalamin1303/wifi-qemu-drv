@@ -14,6 +14,7 @@
 #define WIFI_RESP_BASE      0x100 // BAR1 offset
 
 #define WIFI_CMD_SCAN       1
+#define WIFI_CMD_CONNECT    2
 
 #define WIFI_STATUS_IDLE    0
 #define WIFI_STATUS_BUSY    1
@@ -37,7 +38,7 @@ struct wifi_sim_wiphy_priv {
 };
 
 struct wifi_sim_netdev_priv {
-	// struct delayed_work connect;
+	struct delayed_work connect;
 	// struct net_device *lowerdev;
 	struct net_device *upperdev;
 	u32 tx_packets;
@@ -180,6 +181,18 @@ struct wifi_fw_scan_resp {
     u8  ssid[32];
 };
 
+struct wifi_fw_connect_cmd {
+	u8 bssid[ETH_ALEN];
+	struct {
+        u8 len;
+        u8 ssid[32];
+    } ssid;
+	u16 channel;
+};
+
+struct wifi_fw_connect_resp {
+	bool connect;
+};
 
 
 static u8 router_bssid[ETH_ALEN] = {};
@@ -248,39 +261,6 @@ static void wifi_sim_inform_bss(struct wiphy *wiphy)
 
 }
 
-static void wifi_sim_scan_work(struct work_struct *work)
-{
-	printk("WIFI_SIM: Attempt reading Scan result...\n");
-
-    struct wifi_sim_wiphy_priv *priv =
-        container_of(work, struct wifi_sim_wiphy_priv, scan_work.work);
-
-	//Todo: bar0, bar1 should be the members of struct wifi_sim_wiphy_priv i.e. ioread32(priv->bar0
-
-	if (ioread32(ptr_bar0 + WIFI_STATUS_REG) != WIFI_STATUS_DONE) {
-        schedule_delayed_work(&priv->scan_work, HZ * 2);
-        return;
-    }
-
-	printk("WIFI_SIM: WIFI_STATUS_DONE ! \n");
-	struct wiphy *wiphy = priv_to_wiphy(priv);
-
-
-	wifi_sim_inform_bss(wiphy);
-
-	struct cfg80211_scan_info scan_info = { .aborted = false };
-
-	rtnl_lock();
-	// /* No real hardware → complete scan immediately */
-	cfg80211_scan_done(priv->scan_request, &scan_info);
-
-	// cfg80211_scan_done(priv->scan_request, false);
-	priv->scan_request = NULL;
-	iowrite32(WIFI_STATUS_IDLE, ptr_bar0 + WIFI_STATUS_REG);
-	rtnl_unlock();
-
-}
-
 /* Called with the rtnl lock held. */
 static int wifi_sim_scan(struct wiphy *wiphy,
 			  struct cfg80211_scan_request *request)
@@ -346,59 +326,192 @@ static int wifi_sim_scan(struct wiphy *wiphy,
 	} 
 	else
 		printk("WIFI_SIM: scan_req can't be forward to dev as WIFI_STATUS_REG != IDLE");
-	// wifi_sim_inform_bss(wiphy);
-
-	// /* No real hardware → complete scan immediately */
-	// cfg80211_scan_done(priv->scan_request, &scan_info);
-	// priv->scan_request = NULL;
 
 	return 0;
 }
+
+static void wifi_sim_scan_work(struct work_struct *work)
+{
+	printk("WIFI_SIM: Attempt reading Scan result...\n");
+
+    struct wifi_sim_wiphy_priv *priv =
+        container_of(work, struct wifi_sim_wiphy_priv, scan_work.work);
+
+	//Todo: bar0, bar1 should be the members of struct wifi_sim_wiphy_priv i.e. ioread32(priv->bar0
+
+	if (ioread32(ptr_bar0 + WIFI_STATUS_REG) != WIFI_STATUS_DONE) {
+        schedule_delayed_work(&priv->scan_work, HZ * 2);
+        return;
+    }
+
+	printk("WIFI_SIM: WIFI_STATUS_DONE ! \n");
+	struct wiphy *wiphy = priv_to_wiphy(priv);
+
+
+	wifi_sim_inform_bss(wiphy);
+
+	struct cfg80211_scan_info scan_info = { .aborted = false };
+
+	// rtnl_lock();
+	// /* No real hardware → complete scan immediately */
+	cfg80211_scan_done(priv->scan_request, &scan_info);
+
+	// cfg80211_scan_done(priv->scan_request, false);
+	priv->scan_request = NULL;
+	iowrite32(WIFI_STATUS_IDLE, ptr_bar0 + WIFI_STATUS_REG);
+	// rtnl_unlock();
+
+}
+
+/* May acquire and release the rdev BSS lock. */
+static void wifi_sim_cancel_scan(struct wiphy *wiphy)
+{
+	struct wifi_sim_wiphy_priv *priv = wiphy_priv(wiphy);
+
+	cancel_delayed_work_sync(&priv->scan_work);
+	/* Clean up dangling callbacks if necessary. */
+	if (priv->scan_request) {
+		struct cfg80211_scan_info scan_info = { .aborted = true };
+		/* Schedules work which acquires and releases the rtnl lock. */
+		cfg80211_scan_done(priv->scan_request, &scan_info);
+		priv->scan_request = NULL;
+	}
+}
+
 
 /* Called with the rtnl lock held. */
 static int wifi_sim_connect(struct wiphy *wiphy, struct net_device *netdev,
                             struct cfg80211_connect_params *sme)
 {
     struct wifi_sim_netdev_priv *priv = netdev_priv(netdev);
+	bool could_schedule;
+	struct wifi_fw_connect_cmd cmd = {0};
 
-    printk("WIFI_SIM: connect requested to SSID: %s\n", sme->ssid);
+    printk("WIFI_SIM: connect requested -> SSID: %*pE\n", sme->ssid_len, sme->ssid);
 
     if (priv->being_deleted || !priv->is_up)
         return -EBUSY;
 
-    /* Only accept our fake SSID */
-    if (sme->ssid_len != 8 || strncmp(sme->ssid, "Wifi_sim", 8) != 0) {
-        wiphy_err(wiphy, "unknown SSID\n");
-        return -ENOENT;
-    }
+    // /* Only accept our fake SSID */
+    // if (sme->ssid_len != 8 || strncmp(sme->ssid, "Wifi_sim", 8) != 0) {
+    //     wiphy_err(wiphy, "unknown SSID\n");
+    //     return -ENOENT;
+    // }
 
     /* Set BSSID */
-    if (sme->bssid) {
+    if (sme->bssid && sme->ssid && sme->channel) {
+		printk("WIFI_SIM: connect req have BSSID, SSID, channel\n");
 		ether_addr_copy(priv->connect_requested_bss, sme->bssid);
+		memcpy(cmd.bssid, sme->bssid, ETH_ALEN);
+		memcpy(cmd.ssid.ssid, sme->ssid, sme->ssid_len);
+		cmd.ssid.len = sme->ssid_len;
+		// Todo: logic to cpy channel
 	} 
-	// else {
-	// 	wifi_sim_inform_bss(wiphy);
+	else {
+	// 	wifi_sim_inform_bss(wiphy);  // Todo: Need to request for BSS-Info again, if no BSSID rcvd from scan req 
 	// 	eth_zero_addr(priv->connect_requested_bss);
-	// }
-    /* Mark as connected */
-    priv->is_connected = true;
+	return 0;                        // Todo: logic that will make to sned the connect req again 
+	}
 
-    /* Bring carrier up */
-    netif_carrier_on(netdev);
 	
-	u16 status = WLAN_STATUS_SUCCESS;
 
-    /* Notify cfg80211/wpa_supplicant that connection succeeded */
-    cfg80211_connect_result(netdev,
-                            priv->connect_requested_bss,
-                            NULL, 0,   /* no IE */
-                            NULL, 0,
-							status,         /* status = success */
-                            GFP_KERNEL);
+	if (ioread32(ptr_bar0 + WIFI_STATUS_REG) == WIFI_STATUS_IDLE) {
+		memcpy_toio(ptr_bar1 + WIFI_RESP_BASE, &cmd, sizeof(cmd));
+		printk("WIFI_SIM: connect REQ data sent to device\n");
+		iowrite32(WIFI_CMD_CONNECT, ptr_bar0 + WIFI_CMD_REG);
+		// iowrite32(WIFI_STATUS_BUSY, ptr_bar0 + WIFI_STATUS_REG);
+		printk("WIFI_SIM: connect CMD sent to device\n");
+		could_schedule = schedule_delayed_work(&priv->connect, HZ * 2);
+		if (!could_schedule)
+			return -EBUSY;
+	} 
+	else
+		printk("WIFI_SIM: connect req can't be forward to dev as WIFI_STATUS_REG != IDLE");
+	
 
-    printk("WIFI_SIM: connected to %pM\n", priv->connect_requested_bss);
+
+
+ //--------------------------------------------------
+    /* Mark as connected */
+    // priv->is_connected = true;
+
+    // /* Bring carrier up */
+    // netif_carrier_on(netdev);
+	
+	// u16 status = WLAN_STATUS_SUCCESS;
+
+    // /* Notify cfg80211/wpa_supplicant that connection succeeded */
+    // cfg80211_connect_result(netdev,
+    //                         priv->connect_requested_bss,
+    //                         NULL, 0,   /* no IE */
+    //                         NULL, 0,
+	// 						status,         /* status = success */
+    //                         GFP_KERNEL);
+
+    // printk("WIFI_SIM: connected to %pM\n", priv->connect_requested_bss);
     return 0;
 }
+
+static void wifi_sim_connect_complete(struct work_struct *work)
+{
+	printk("WIFI_SIM: Attempt reading Connect result...\n");
+	
+	struct wifi_sim_netdev_priv *priv =
+		container_of(work, struct wifi_sim_netdev_priv, connect.work);
+
+	if (ioread32(ptr_bar0 + WIFI_STATUS_REG) != WIFI_STATUS_DONE) {
+        schedule_delayed_work(&priv->connect, HZ * 2);
+        return;
+    }	
+
+	printk("WIFI_SIM: WIFI_STATUS_DONE ! \n");
+
+	
+	struct wifi_fw_connect_resp resp;
+	u16 status = WLAN_STATUS_SUCCESS;
+	u8 *requested_bss = priv->connect_requested_bss;
+
+	memcpy_fromio(&resp, ptr_bar1 + WIFI_RESP_BASE, sizeof(resp));
+	
+	printk("WIFI_SIM: Response connect = %u\n", resp.connect);
+
+	// if (is_zero_ether_addr(requested_bss))
+	// 	requested_bss = NULL;
+
+	if (!priv->is_up || !resp.connect)
+		status = WLAN_STATUS_UNSPECIFIED_FAILURE;
+	else
+		priv->is_connected = true;
+
+	// rtnl_lock();
+	/* Schedules an event that acquires the rtnl lock. */
+	cfg80211_connect_result(priv->upperdev, requested_bss, NULL, 0, NULL, 0,
+				status, GFP_KERNEL);
+	if (status == WLAN_STATUS_SUCCESS)			
+		netif_carrier_on(priv->upperdev);
+
+	iowrite32(WIFI_STATUS_IDLE, ptr_bar0 + WIFI_STATUS_REG);
+	// rtnl_unlock();
+
+}
+
+
+/* May acquire and release the rdev event lock. */
+static void wifi_sim_cancel_connect(struct net_device *netdev)
+{
+	struct wifi_sim_netdev_priv *priv = netdev_priv(netdev);
+
+	/* If there is work pending, clean up dangling callbacks. */
+	if (cancel_delayed_work_sync(&priv->connect)) {
+		/* Schedules an event that acquires the rtnl lock. */
+		cfg80211_connect_result(priv->upperdev,
+					priv->connect_requested_bss, NULL, 0,
+					NULL, 0,
+					WLAN_STATUS_UNSPECIFIED_FAILURE,
+					GFP_KERNEL);
+	}
+}
+
 
 /* Called with the rtnl lock held. Acquires the rdev event lock. */
 static int wifi_sim_disconnect(struct wiphy *wiphy, struct net_device *netdev,
@@ -410,7 +523,7 @@ static int wifi_sim_disconnect(struct wiphy *wiphy, struct net_device *netdev,
 		return -EBUSY;
 
 	wiphy_debug(wiphy, "disconnect\n");
-	// wifi_sim_cancel_connect(netdev);
+	wifi_sim_cancel_connect(netdev);
 
 	cfg80211_disconnected(netdev, reason_code, NULL, 0, true, GFP_KERNEL);
 	priv->is_connected = false;
@@ -464,9 +577,9 @@ static int wifi_sim_net_device_stop(struct net_device *dev)
 	if (!dev->ieee80211_ptr)
 		return 0;
 
-	// wifi_sim_cancel_scan(dev->ieee80211_ptr->wiphy);
-	// wifi_sim_cancel_connect(dev);
-	// netif_carrier_off(dev);
+	wifi_sim_cancel_scan(dev->ieee80211_ptr->wiphy);
+	wifi_sim_cancel_connect(dev);
+	netif_carrier_off(dev);
 
 	return 0;
 }
@@ -525,8 +638,12 @@ wifi_sim_add_interface(struct wiphy *wiphy,
 	netdev->ieee80211_ptr = wdev;
 
 	priv = netdev_priv(netdev);
+	priv->upperdev = netdev; 
+	priv->being_deleted = false;
 	priv->is_up = false;
 	priv->is_connected = false;
+
+	INIT_DELAYED_WORK(&priv->connect, wifi_sim_connect_complete);
 
 	if (register_netdev(netdev)) {
 		kfree(wdev);
@@ -718,13 +835,13 @@ static void wifi_sim_destroy_wiphy(struct wiphy *wiphy)
 
 	priv = wiphy_priv(wiphy);
 	priv->being_deleted = true;
-	// wifi_sim_cancel_scan(wiphy);
+	wifi_sim_cancel_scan(wiphy);
 
-	/* Abort ongoing scan */
-	if (priv->scan_request) {
-		cfg80211_scan_done(priv->scan_request, true);
-		priv->scan_request = NULL;
-	}
+	// /* Abort ongoing scan */
+	// if (priv->scan_request) {
+	// 	cfg80211_scan_done(priv->scan_request, true);
+	// 	priv->scan_request = NULL;
+	// }
 	
 	if (wiphy->registered)
 		wiphy_unregister(wiphy);
