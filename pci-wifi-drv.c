@@ -428,27 +428,6 @@ static int wifi_sim_connect(struct wiphy *wiphy, struct net_device *netdev,
 	else
 		printk("WIFI_SIM: connect req can't be forward to dev as WIFI_STATUS_REG != IDLE");
 	
-
-
-
- //--------------------------------------------------
-    /* Mark as connected */
-    // priv->is_connected = true;
-
-    // /* Bring carrier up */
-    // netif_carrier_on(netdev);
-	
-	// u16 status = WLAN_STATUS_SUCCESS;
-
-    // /* Notify cfg80211/wpa_supplicant that connection succeeded */
-    // cfg80211_connect_result(netdev,
-    //                         priv->connect_requested_bss,
-    //                         NULL, 0,   /* no IE */
-    //                         NULL, 0,
-	// 						status,         /* status = success */
-    //                         GFP_KERNEL);
-
-    // printk("WIFI_SIM: connected to %pM\n", priv->connect_requested_bss);
     return 0;
 }
 
@@ -727,46 +706,6 @@ static struct wiphy *wifi_sim_make_wiphy(void) {
 	return wiphy;
 }
 
-// static struct net_device *wifi_sim_make_netdev(void) { 
-// 	struct net_device *netdev;
-// 	struct wifi_sim_netdev_priv *priv;
-// 	int err;
-
-// 	printk("WIFI_SIM: pci-wifi-drv - Creating net_device\n");
-// 	netdev = alloc_etherdev(sizeof(*priv));
-// 	if(!netdev)
-// 		return NULL;
-
-// 	// SET_NETDEV_DEV(netdev, &pdev->dev); // Todo: where is pdev ??
-// 	netdev->netdev_ops = &wifi_netdev_ops;
-// 	netdev->needs_free_netdev  = true;
-
-// 	// SET_NETDEV_DEV(netdev, &priv->lowerdev->dev);   // Todo: who will be parent ?   
-// 	// 4. Link wiphy to net_device
-// 	struct wireless_dev *wdev;
-// 	wdev = netdev->ieee80211_ptr; 
-
-// 	wdev = kzalloc(sizeof(*netdev->ieee80211_ptr), GFP_KERNEL);
-// 	if (!netdev->ieee80211_ptr) {
-// 		err = -ENOMEM;
-// 		goto remove_handler;
-// 	}
-
-	
-
-// 	wdev->wiphy = common_wiphy;
-// 	wdev->netdev = netdev;
-// 	wdev->iftype = NL80211_IFTYPE_STATION;
-// 	register_netdev(netdev);
-
-// 	return netdev;
-
-// 	remove_handler:
-// 		free_netdev(netdev);
-// 		return NULL;
-
-// }
-
 static int wifi_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
 	
 	int status;
@@ -836,12 +775,6 @@ static void wifi_sim_destroy_wiphy(struct wiphy *wiphy)
 	priv = wiphy_priv(wiphy);
 	priv->being_deleted = true;
 	wifi_sim_cancel_scan(wiphy);
-
-	// /* Abort ongoing scan */
-	// if (priv->scan_request) {
-	// 	cfg80211_scan_done(priv->scan_request, true);
-	// 	priv->scan_request = NULL;
-	// }
 	
 	if (wiphy->registered)
 		wiphy_unregister(wiphy);
