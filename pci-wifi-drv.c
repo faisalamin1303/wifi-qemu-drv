@@ -181,6 +181,8 @@ struct wifi_fw_scan_resp {
     u8  ssid[32];
 };
 
+// #define WIFI_MAX_PSK_LEN 32
+
 struct wifi_fw_connect_cmd {
 	u8 bssid[ETH_ALEN];
 	struct {
@@ -188,6 +190,8 @@ struct wifi_fw_connect_cmd {
         u8 ssid[32];
     } ssid;
 	u16 channel;
+	// u8 psk_len;
+    // u8 psk[WIFI_MAX_PSK_LEN];
 };
 
 struct wifi_fw_connect_resp {
@@ -406,6 +410,8 @@ static int wifi_sim_connect(struct wiphy *wiphy, struct net_device *netdev,
 		memcpy(cmd.ssid.ssid, sme->ssid, sme->ssid_len);
 		cmd.ssid.len = sme->ssid_len;
 		// Todo: logic to cpy channel
+		// cmd.psk_len = sme->key_len;
+    	// memcpy(cmd.psk, sme->key, sme->key_len);
 	} 
 	else {
 	// 	wifi_sim_inform_bss(wiphy);  // Todo: Need to request for BSS-Info again, if no BSSID rcvd from scan req 
@@ -511,12 +517,10 @@ static int wifi_sim_disconnect(struct wiphy *wiphy, struct net_device *netdev,
 	return 0;
 }
 
-
 /*
 * NET DEVICE OPERATIONS
 */
 
-/* Enters and exits a RCU-bh critical section. */
 static netdev_tx_t wifi_sim_start_xmit(struct sk_buff *skb,
 					struct net_device *dev)
 {
@@ -528,7 +532,7 @@ static netdev_tx_t wifi_sim_start_xmit(struct sk_buff *skb,
 		return NET_XMIT_DROP;
 	}
 
-	/* For now, just drop packets instead of sending */
+	/* For now just drop packets instead of sending */
     dev_kfree_skb(skb);
     return NET_XMIT_SUCCESS;
 
