@@ -8,17 +8,28 @@
 #include <linux/math64.h>
 #include <linux/module.h>
 
-#define WIFI_CMD_REG        0x00  // write
-#define WIFI_STATUS_REG     0x04  // read/write
-#define WIFI_RESP_COUNT     0x08  // read
-#define WIFI_RESP_BASE      0x100 // BAR1 offset
+#define WIFI_CMD_REG         0x00  // write
+#define WIFI_STATUS_REG      0x04  // read/write
+#define WIFI_RESP_COUNT      0x08  // read
 
-#define WIFI_CMD_SCAN       1
-#define WIFI_CMD_CONNECT    2
+#define WIFI_CMD_SCAN        1
+#define WIFI_CMD_CONNECT     2
+#define WIFI_CMD_TX_DATA     3
+#define WIFI_CMD_RX_READY    4   /* optional */
 
-#define WIFI_STATUS_IDLE    0
-#define WIFI_STATUS_BUSY    1
-#define WIFI_STATUS_DONE    2
+#define WIFI_STATUS_IDLE     0
+#define WIFI_STATUS_BUSY     1
+#define WIFI_STATUS_DONE     2
+#define WIFI_STATUS_RX_AVAIL 3
+
+
+#define WIFI_RESP_BASE       0x100 // BAR1 offset
+#define WIFI_TX_BASE         0x200
+#define WIFI_RX_BASE         0x400
+#define WIFI_TX_LEN_REG      0x0C
+#define WIFI_RX_LEN_REG      0x10
+
+#define WIFI_MAX_FRAME_SIZE  1600
 
 
 void __iomem *ptr_bar0, __iomem *ptr_bar1;
@@ -39,6 +50,8 @@ struct wifi_sim_wiphy_priv {
 
 struct wifi_sim_netdev_priv {
 	struct delayed_work connect;
+	struct delayed_work tx;
+	struct delayed_work rx;
 	// struct net_device *lowerdev;
 	struct net_device *upperdev;
 	u32 tx_packets;
@@ -524,21 +537,76 @@ static int wifi_sim_disconnect(struct wiphy *wiphy, struct net_device *netdev,
 static netdev_tx_t wifi_sim_start_xmit(struct sk_buff *skb,
 					struct net_device *dev)
 {
+	printk("WIFI_SIM: tx handler called by netdev handler !\n");
+
+	if (ioread32(ptr_bar0 + WIFI_STATUS_REG) != WIFI_STATUS_IDLE) {
+		netif_stop_queue(dev);
+        return NETDEV_TX_BUSY;
+    }
+
+	u32 len;
 	struct wifi_sim_netdev_priv *priv = netdev_priv(dev);
 
-	priv->tx_packets++;
-	if (!priv->is_connected) {
-		priv->tx_failed++;
-		return NET_XMIT_DROP;
-	}
+	// priv->tx_packets++;
+	// if (!priv->is_connected) {
+	// 	priv->tx_failed++;
+	// 	return NET_XMIT_DROP;
+	// }
 
-	/* For now just drop packets instead of sending */
+
+	// if (tx_in_progress) {
+    //     netif_stop_queue(dev);
+    //     return NETDEV_TX_BUSY;
+    // }
+
+    len = skb->len;
+	priv->tx_packets++;
+    if ((len > WIFI_MAX_FRAME_SIZE) || (!priv->is_connected)) {
+		priv->tx_failed++;
+        dev_kfree_skb(skb);
+        return NET_XMIT_DROP;
+    }
+
+    printk("WIFI_SIM_TX: len=%u\n", len);
+    print_hex_dump(KERN_INFO, "WIFI_SIM_TX: ",
+                   DUMP_PREFIX_OFFSET, 16, 1,
+                   skb->data, len, false);
+
+    /* Copy frame to BAR1 */
+    memcpy_toio(ptr_bar1 + WIFI_TX_BASE, skb->data, len);
+    iowrite32(len, ptr_bar0 + WIFI_TX_LEN_REG);
+
+	// tx_in_progress = 1;
+    /* Notify device */
+    iowrite32(WIFI_CMD_TX_DATA, ptr_bar0 + WIFI_CMD_REG);
+
     dev_kfree_skb(skb);
+	schedule_delayed_work(&priv->tx, HZ * 2);
+
     return NET_XMIT_SUCCESS;
 
-	// skb->dev = priv->lowerdev;
-	// return dev_queue_xmit(skb);
-	// return 0;
+}
+
+static void wifi_sim_xmit_complete(struct work_struct *work)
+{
+	printk("WIFI_SIM_TX: Checking whether Status register = DONE !...\n");
+
+	struct wifi_sim_netdev_priv *priv =
+		container_of(work, struct wifi_sim_netdev_priv, tx.work);
+
+	if (ioread32(ptr_bar0 + WIFI_STATUS_REG) != WIFI_STATUS_DONE) {
+        schedule_delayed_work(&priv->tx, HZ * 2);
+        return;
+    }	
+
+	printk("WIFI_SIM: WIFI_STATUS_DONE ! \n");
+
+	// tx_in_progress = 0;
+    netif_wake_queue(priv->upperdev);
+
+	iowrite32(WIFI_STATUS_IDLE, ptr_bar0 + WIFI_STATUS_REG);
+	// rtnl_unlock();
+
 }
 
 /* Called with rtnl lock held. */
@@ -563,6 +631,8 @@ static int wifi_sim_net_device_stop(struct net_device *dev)
 	wifi_sim_cancel_scan(dev->ieee80211_ptr->wiphy);
 	wifi_sim_cancel_connect(dev);
 	netif_carrier_off(dev);
+
+	cancel_delayed_work_sync(&n_priv->tx);
 
 	return 0;
 }
@@ -627,6 +697,7 @@ wifi_sim_add_interface(struct wiphy *wiphy,
 	priv->is_connected = false;
 
 	INIT_DELAYED_WORK(&priv->connect, wifi_sim_connect_complete);
+	INIT_DELAYED_WORK(&priv->tx, wifi_sim_xmit_complete);
 
 	if (register_netdev(netdev)) {
 		kfree(wdev);
