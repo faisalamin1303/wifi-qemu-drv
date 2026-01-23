@@ -21,6 +21,7 @@
 #define WIFI_STATUS_BUSY     1
 #define WIFI_STATUS_DONE     2
 #define WIFI_STATUS_RX_AVAIL 3
+#define WIFI_STATUS_RX_DONE  4
 
 
 #define WIFI_RESP_BASE       0x100 // BAR1 offset
@@ -36,6 +37,10 @@ void __iomem *ptr_bar0, __iomem *ptr_bar1;
 
 #define VID 0x1234
 #define DID 0xbeef
+/* TODO: device should provide the MAC addr*/
+static const u8 wifi_mac_addr[ETH_ALEN] = {
+    0x02, 0x11, 0x22, 0x34, 0x45, 0x56
+};
 
 static struct wiphy *common_wiphy;
 static struct wireless_dev *common_wdev;
@@ -405,6 +410,7 @@ static int wifi_sim_connect(struct wiphy *wiphy, struct net_device *netdev,
 	struct wifi_fw_connect_cmd cmd = {0};
 
     printk("WIFI_SIM: connect requested -> SSID: %*pE\n", sme->ssid_len, sme->ssid);
+	printk("WIFI_SIM: connect requested -> BSSID: %*pE\n", ETH_ALEN, sme->bssid);
 
     if (priv->being_deleted || !priv->is_up)
         return -EBUSY;
@@ -537,27 +543,15 @@ static int wifi_sim_disconnect(struct wiphy *wiphy, struct net_device *netdev,
 static netdev_tx_t wifi_sim_start_xmit(struct sk_buff *skb,
 					struct net_device *dev)
 {
-	printk("WIFI_SIM: tx handler called by netdev handler !\n");
+	// printk("WIFI_SIM: tx handler called by netdev handler !\n");
 
 	if (ioread32(ptr_bar0 + WIFI_STATUS_REG) != WIFI_STATUS_IDLE) {
-		netif_stop_queue(dev);
+		// netif_stop_queue(dev);
         return NETDEV_TX_BUSY;
     }
 
 	u32 len;
 	struct wifi_sim_netdev_priv *priv = netdev_priv(dev);
-
-	// priv->tx_packets++;
-	// if (!priv->is_connected) {
-	// 	priv->tx_failed++;
-	// 	return NET_XMIT_DROP;
-	// }
-
-
-	// if (tx_in_progress) {
-    //     netif_stop_queue(dev);
-    //     return NETDEV_TX_BUSY;
-    // }
 
     len = skb->len;
 	priv->tx_packets++;
@@ -601,8 +595,7 @@ static void wifi_sim_xmit_complete(struct work_struct *work)
 
 	printk("WIFI_SIM: WIFI_STATUS_DONE ! \n");
 
-	// tx_in_progress = 0;
-    netif_wake_queue(priv->upperdev);
+    // netif_wake_queue(priv->upperdev);
 
 	iowrite32(WIFI_STATUS_IDLE, ptr_bar0 + WIFI_STATUS_REG);
 	// rtnl_unlock();
@@ -674,6 +667,12 @@ wifi_sim_add_interface(struct wiphy *wiphy,
 			      name_assign_type, ether_setup);
 	if (!netdev)
 		return ERR_PTR(-ENOMEM);
+
+// #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
+    ether_addr_copy(netdev->dev_addr, wifi_mac_addr);
+// #else
+//     dev_addr_set(netdev, wifi_mac_addr);
+// #endif
 
 	netdev->netdev_ops = &wifi_netdev_ops;
 	SET_NETDEV_DEV(netdev, wiphy_dev(wiphy));
