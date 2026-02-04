@@ -10,25 +10,31 @@
 
 #define WIFI_CMD_REG         0x00  // write
 #define WIFI_STATUS_REG      0x04  // read/write
-#define WIFI_RESP_COUNT      0x08  // read
+// #define WIFI_RESP_COUNT      0x08  // read
+#define WIFI_RX_STATUS_REG   0x08
+#define WIFI_TX_LEN_REG      0x0C
+#define WIFI_RX_LEN_REG      0x10
 
 #define WIFI_CMD_SCAN        1
 #define WIFI_CMD_CONNECT     2
 #define WIFI_CMD_TX_DATA     3
-#define WIFI_CMD_RX_READY    4   /* optional */
+// #define WIFI_CMD_RX_READY    4   /* optional */
 
 #define WIFI_STATUS_IDLE     0
 #define WIFI_STATUS_BUSY     1
 #define WIFI_STATUS_DONE     2
 #define WIFI_STATUS_RX_AVAIL 3
-#define WIFI_STATUS_RX_DONE  4
+#define WIFI_STATUS_RX_IDLE  4
+#define WIFI_STATUS_RX_BUSY  5
+#define WIFI_STATUS_RX_DONE  6
 
 
 #define WIFI_RESP_BASE       0x100 // BAR1 offset
 #define WIFI_TX_BASE         0x200
 #define WIFI_RX_BASE         0x400
-#define WIFI_TX_LEN_REG      0x0C
-#define WIFI_RX_LEN_REG      0x10
+// #define WIFI_TX_LEN_REG      0x500
+// #define WIFI_RX_LEN_REG      0x510
+
 
 #define WIFI_MAX_FRAME_SIZE  1600
 
@@ -61,6 +67,7 @@ struct wifi_sim_netdev_priv {
 	struct net_device *upperdev;
 	u32 tx_packets;
 	u32 tx_failed;
+	u32 rx_packets;
 	u8 connect_requested_bss[ETH_ALEN];
 	bool is_up;
 	bool is_connected;
@@ -233,7 +240,8 @@ static void wifi_sim_inform_bss(struct wiphy *wiphy)
 	// const u8 bssid[ETH_ALEN] = { 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 };
 	
 
-	int count = ioread32(ptr_bar0 + WIFI_RESP_COUNT);
+	// int count = ioread32(ptr_bar0 + WIFI_RESP_COUNT);  //Todo: temp commented
+	int count = 1;
 	struct wifi_fw_scan_resp resp;
 	
 	printk("WIFI_SIM: Device response received !\n");
@@ -435,7 +443,7 @@ static int wifi_sim_connect(struct wiphy *wiphy, struct net_device *netdev,
 	else {
 	// 	wifi_sim_inform_bss(wiphy);  // Todo: Need to request for BSS-Info again, if no BSSID rcvd from scan req 
 	// 	eth_zero_addr(priv->connect_requested_bss);
-	return 0;                        // Todo: logic that will make to sned the connect req again 
+	return 0;                        // Todo: logic that will make to send the connect req again 
 	}
 
 	
@@ -547,6 +555,7 @@ static netdev_tx_t wifi_sim_start_xmit(struct sk_buff *skb,
 
 	if (ioread32(ptr_bar0 + WIFI_STATUS_REG) != WIFI_STATUS_IDLE) {
 		// netif_stop_queue(dev);
+		// printk("WIFI_SIM_TX: Status NOT EQUAL TO IDLE !");
         return NETDEV_TX_BUSY;
     }
 
@@ -569,13 +578,14 @@ static netdev_tx_t wifi_sim_start_xmit(struct sk_buff *skb,
     /* Copy frame to BAR1 */
     memcpy_toio(ptr_bar1 + WIFI_TX_BASE, skb->data, len);
     iowrite32(len, ptr_bar0 + WIFI_TX_LEN_REG);
-
+	
 	// tx_in_progress = 1;
     /* Notify device */
     iowrite32(WIFI_CMD_TX_DATA, ptr_bar0 + WIFI_CMD_REG);
 
     dev_kfree_skb(skb);
-	schedule_delayed_work(&priv->tx, HZ * 2);
+	// schedule_delayed_work(&priv->tx, HZ * 2);
+	schedule_delayed_work(&priv->tx, msecs_to_jiffies(100)); 
 
     return NET_XMIT_SUCCESS;
 
@@ -589,7 +599,8 @@ static void wifi_sim_xmit_complete(struct work_struct *work)
 		container_of(work, struct wifi_sim_netdev_priv, tx.work);
 
 	if (ioread32(ptr_bar0 + WIFI_STATUS_REG) != WIFI_STATUS_DONE) {
-        schedule_delayed_work(&priv->tx, HZ * 2);
+        // schedule_delayed_work(&priv->tx, HZ * 2);
+		schedule_delayed_work(&priv->tx, msecs_to_jiffies(100)); 
         return;
     }	
 
@@ -602,12 +613,68 @@ static void wifi_sim_xmit_complete(struct work_struct *work)
 
 }
 
+static void wifi_sim_rx_work(struct work_struct *work)
+{
+    struct wifi_sim_netdev_priv *priv = 
+        container_of(work, struct wifi_sim_netdev_priv, rx.work);
+    struct sk_buff *skb;
+    u32 status;
+    u32 len;
+
+    if (priv->being_deleted || !priv->is_up)
+        return;
+
+    status = ioread32(ptr_bar0 + WIFI_RX_STATUS_REG);
+
+    if (status == WIFI_STATUS_RX_AVAIL) {
+		printk("WIFI_SIM: RX available!\n");
+        /* Mark as BUSY so QEMU doesn't overwrite while we read */
+        iowrite32(WIFI_STATUS_RX_BUSY, ptr_bar0 + WIFI_RX_STATUS_REG);
+
+        len = ioread32(ptr_bar0 + WIFI_RX_LEN_REG);
+		printk("WIFI_SIM: RX data len = %u bytes\n", len);
+		
+		print_hex_dump(KERN_INFO, "WIFI_SIM_RX: ",
+                   DUMP_PREFIX_OFFSET, 16, 1,
+                   ptr_bar1 + WIFI_RX_BASE, len, false);
+
+
+        
+        if (len > 0 && len <= WIFI_MAX_FRAME_SIZE) {
+            /* Allocate SKB */
+            skb = netdev_alloc_skb(priv->upperdev, len + 2); // +2 for alignment
+            if (skb) {
+                skb_reserve(skb, 2); 
+                /* Copy from BAR1 to Kernel memory */
+                memcpy_fromio(skb_put(skb, len), ptr_bar1 + WIFI_RX_BASE, len);
+                
+                skb->protocol = eth_type_trans(skb, priv->upperdev);
+                skb->ip_summed = CHECKSUM_UNNECESSARY;
+
+                /* Push to Network Stack */
+                netif_rx(skb);
+                priv->rx_packets++;
+                
+                printk(KERN_INFO "WIFI_SIM: RX packet pushed to stack (%u bytes)\n", len);
+            }
+        }
+
+        /* Complete Handshake */
+        iowrite32(WIFI_STATUS_RX_DONE, ptr_bar0 + WIFI_RX_STATUS_REG);
+    }
+
+    /* Reschedule the poll (adjust HZ / X for faster/slower polling) */
+    schedule_delayed_work(&priv->rx, msecs_to_jiffies(100)); 
+	// schedule_delayed_work(&priv->rx, HZ * 1); 
+}
+
 /* Called with rtnl lock held. */
 static int wifi_sim_net_device_open(struct net_device *dev)
 {
 	struct wifi_sim_netdev_priv *priv = netdev_priv(dev);
-
 	priv->is_up = true;
+	// schedule_delayed_work(&priv->rx, 1); /* Start polling */
+	schedule_delayed_work(&priv->rx, HZ * 1); 
 	return 0;
 }
 
@@ -615,7 +682,6 @@ static int wifi_sim_net_device_open(struct net_device *dev)
 static int wifi_sim_net_device_stop(struct net_device *dev)
 {
 	struct wifi_sim_netdev_priv *n_priv = netdev_priv(dev);
-
 	n_priv->is_up = false;
 
 	if (!dev->ieee80211_ptr)
@@ -626,7 +692,9 @@ static int wifi_sim_net_device_stop(struct net_device *dev)
 	netif_carrier_off(dev);
 
 	cancel_delayed_work_sync(&n_priv->tx);
+	cancel_delayed_work_sync(&n_priv->rx); /* Stop rx polling */
 
+	
 	return 0;
 }
 
@@ -697,6 +765,7 @@ wifi_sim_add_interface(struct wiphy *wiphy,
 
 	INIT_DELAYED_WORK(&priv->connect, wifi_sim_connect_complete);
 	INIT_DELAYED_WORK(&priv->tx, wifi_sim_xmit_complete);
+	INIT_DELAYED_WORK(&priv->rx, wifi_sim_rx_work);
 
 	if (register_netdev(netdev)) {
 		kfree(wdev);
@@ -784,7 +853,6 @@ static int wifi_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
 	
 	int status;
 	// int err;
-	// void __iomem *ptr_bar0, __iomem *ptr_bar1;
 	status = pcim_enable_device(pdev);
 	if(status != 0){
 		printk("WIFI_SIM: pci-wifi-drv - Error enabling device\n");
